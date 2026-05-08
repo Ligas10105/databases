@@ -1,0 +1,32 @@
+collection:
+  interval_minutes: 30
+  cities:
+    - {name: Warsaw, country: PL, lat: 52.23, lon: 21.01}
+    - {name: Krakow, country: PL, lat: 50.06, lon: 19.94}
+    - {name: Berlin, country: DE, lat: 52.52, lon: 13.40}
+    - {name: Prague, country: CZ, lat: 50.08, lon: 14.44}
+    - {name: Vienna, country: AT, lat: 48.21, lon: 16.37}
+    - {name: Paris, country: FR, lat: 48.85, lon: 2.35}
+    - {name: Amsterdam, country: NL, lat: 52.37, lon: 4.90}
+    - {name: Brussels, country: BE, lat: 50.85, lon: 4.35}
+    - {name: Budapest, country: HU, lat: 47.50, lon: 19.04}
+    - {name: Bucharest, country: RO, lat: 44.43, lon: 26.10}
+    - {name: Sofia, country: BG, lat: 42.70, lon: 23.32}
+    - {name: Athens, country: GR, lat: 37.98, lon: 23.73}
+    - {name: Rome, country: IT, lat: 41.90, lon: 12.49}
+    - {name: Madrid, country: ES, lat: 40.42, lon: -3.70}
+    - {name: Lisbon, country: PT, lat: 38.72, lon: -9.14}
+    - {name: Stockholm, country: SE, lat: 59.33, lon: 18.07}
+    - {name: Oslo, country: "NO", lat: 59.91, lon: 10.75}
+    - {name: Copenhagen, country: DK, lat: 55.68, lon: 12.57}
+    - {name: Helsinki, country: FI, lat: 60.17, lon: 24.94}
+    - {name: Zurich, country: CH, lat: 47.38, lon: 8.54}
+
+api:
+  openweathermap_base: https://api.openweathermap.org/data/2.5/weather
+  open_meteo_base: https://api.open-meteo.com/v1/forecast
+  timeout_seconds: 10
+  retry_attempts: 3
+
+database:
+  path: data/weather.db

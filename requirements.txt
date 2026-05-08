@@ -1,0 +1,10 @@
+requests
+apscheduler
+python-dotenv
+pyyaml
+streamlit
+plotly
+folium
+streamlit-folium
+pandas
+pytest
