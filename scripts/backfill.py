@@ -1,13 +1,14 @@
-"""Backfill — zasilenie bazy prawdziwą historią pogody (rozdzielczość godzinowa).
+"""Backfill — logowanie historii pogody z Open-Meteo do bazy (rozdzielczość godzinowa).
 
-Dwa tryby:
-  --start/--end  (GŁÓWNY) — Open-Meteo Historical Weather API (reanaliza ERA5),
-                 jawny zakres dat YYYY-MM-DD. Uwaga: archiwum bywa opóźnione
-                 o ok. 2-5 dni, najświeższe godziny mogą być puste — to normalne.
-  --days N       (alternatywa) — /v1/forecast z past_days (max 92 dni wstecz).
+Pobiera ostatnie N dni (parametr past_days API, max 92) godzina po godzinie
+dla wszystkich miast z config.yaml i wstawia do tabeli measurements.
+Godziny z przyszłości (API zwraca też prognozę na resztę dzisiejszej doby)
+są odcinane — logujemy tylko to, co już się wydarzyło.
+
+Dzięki UNIQUE(city_id, timestamp) + INSERT OR IGNORE skrypt można odpalać
+wielokrotnie — dokleja tylko nowe godziny, duplikaty pomija.
 
 Uruchomienie:
-  python scripts/backfill.py --start 2026-05-28 --end 2026-06-08
   python scripts/backfill.py --days 14
 """
 from __future__ import annotations
@@ -16,7 +17,7 @@ import argparse
 import logging
 import sys
 import time
-from datetime import date, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -25,7 +26,6 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from collector.api_client import _wmo_to_desc, _wmo_to_main
 from collector.db import get_city_id, get_connection, insert_measurement, log_collection_run
 
 logging.basicConfig(
@@ -35,7 +35,6 @@ logging.basicConfig(
 logger = logging.getLogger("backfill")
 
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
-ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 HOURLY_VARS = [
     "temperature_2m",
     "apparent_temperature",
@@ -47,6 +46,48 @@ HOURLY_VARS = [
     "weathercode",
 ]
 
+# Mapowanie kodów pogody WMO (kolumna weathercode w Open-Meteo)
+# na kategorię (weather_main) i opis (weather_desc).
+_WMO_MAIN = {
+    0: "Clear",
+    1: "Clear", 2: "Clouds", 3: "Clouds",
+    45: "Fog", 48: "Fog",
+    51: "Drizzle", 53: "Drizzle", 55: "Drizzle",
+    56: "Drizzle", 57: "Drizzle",
+    61: "Rain", 63: "Rain", 65: "Rain",
+    66: "Rain", 67: "Rain",
+    71: "Snow", 73: "Snow", 75: "Snow", 77: "Snow",
+    80: "Rain", 81: "Rain", 82: "Rain",
+    85: "Snow", 86: "Snow",
+    95: "Thunderstorm", 96: "Thunderstorm", 99: "Thunderstorm",
+}
+
+_WMO_DESC = {
+    0: "clear sky",
+    1: "mainly clear", 2: "partly cloudy", 3: "overcast",
+    45: "fog", 48: "depositing rime fog",
+    51: "light drizzle", 53: "moderate drizzle", 55: "dense drizzle",
+    56: "light freezing drizzle", 57: "dense freezing drizzle",
+    61: "slight rain", 63: "moderate rain", 65: "heavy rain",
+    66: "light freezing rain", 67: "heavy freezing rain",
+    71: "slight snow", 73: "moderate snow", 75: "heavy snow", 77: "snow grains",
+    80: "slight rain showers", 81: "moderate rain showers", 82: "violent rain showers",
+    85: "slight snow showers", 86: "heavy snow showers",
+    95: "thunderstorm", 96: "thunderstorm with slight hail", 99: "thunderstorm with heavy hail",
+}
+
+
+def _wmo_to_main(code: int | None) -> str | None:
+    if code is None:
+        return None
+    return _WMO_MAIN.get(int(code), "Unknown")
+
+
+def _wmo_to_desc(code: int | None) -> str | None:
+    if code is None:
+        return None
+    return _WMO_DESC.get(int(code), "unknown")
+
 
 def load_config() -> dict:
     with open(PROJECT_ROOT / "config.yaml", "r", encoding="utf-8") as f:
@@ -54,90 +95,12 @@ def load_config() -> dict:
 
 
 def _normalize_ts(t: str) -> str:
-    """Open-Meteo returns 'YYYY-MM-DDTHH:MM' (UTC). We need 'YYYY-MM-DDTHH:MM:SSZ'."""
+    """Open-Meteo zwraca 'YYYY-MM-DDTHH:MM' (UTC); w bazie trzymamy 'YYYY-MM-DDTHH:MM:SSZ'."""
     if len(t) == 16:
         return t + ":00Z"
     if t.endswith("Z"):
         return t
     return t + "Z"
-
-
-def _hourly_to_rows(hourly: dict) -> list[dict]:
-    """Mapuje blok `hourly` z odpowiedzi Open-Meteo na wiersze do tabeli measurements.
-
-    Wspólne dla obu trybów (forecast z past_days oraz archive) — oba API
-    zwracają identyczną strukturę: time[], temperature_2m[], itd.
-    Godziny bez danych (None w temperature_2m — np. opóźnienie archiwum ERA5)
-    są pomijane, nie traktujemy ich jako błąd.
-    """
-    times = hourly.get("time") or []
-    rows: list[dict] = []
-    for i, t in enumerate(times):
-        def at(key: str):
-            arr = hourly.get(key) or []
-            return arr[i] if i < len(arr) else None
-
-        if at("temperature_2m") is None:
-            continue
-
-        wcode = at("weathercode")
-        rows.append({
-            "timestamp": _normalize_ts(t),
-            "temp_c": at("temperature_2m"),
-            "feels_like_c": at("apparent_temperature"),
-            "temp_min_c": None,
-            "temp_max_c": None,
-            "humidity_pct": _to_int(at("relativehumidity_2m")),
-            "pressure_hpa": _to_int(at("pressure_msl")),
-            "wind_speed_ms": _kmh_to_ms(at("windspeed_10m")),
-            "wind_deg": _to_int(at("winddirection_10m")),
-            "clouds_pct": _to_int(at("cloudcover")),
-            "weather_main": _wmo_to_main(int(wcode)) if wcode is not None else None,
-            "weather_desc": _wmo_to_desc(int(wcode)) if wcode is not None else None,
-            "source": "open_meteo_archive",
-        })
-    return rows
-
-
-def _fetch_hourly(url: str, params: dict, city_name: str, timeout: int) -> list[dict] | None:
-    """Wspólny GET + parsowanie. Zwraca wiersze, [] gdy brak danych, None przy błędzie."""
-    try:
-        resp = requests.get(url, params=params, timeout=timeout)
-        resp.raise_for_status()
-        payload = resp.json()
-    except requests.RequestException as exc:
-        logger.warning("HTTP fail for %s: %s", city_name, exc)
-        return None
-    except ValueError as exc:
-        logger.warning("Bad JSON for %s: %s", city_name, exc)
-        return None
-    return _hourly_to_rows(payload.get("hourly") or {})
-
-
-def fetch_history(city: dict, past_days: int, timeout: int = 20) -> list[dict] | None:
-    """Tryb --days: ostatnie N dni z /v1/forecast (past_days)."""
-    params = {
-        "latitude": city["lat"],
-        "longitude": city["lon"],
-        "past_days": past_days,
-        "forecast_days": 1,
-        "hourly": ",".join(HOURLY_VARS),
-        "timezone": "GMT",
-    }
-    return _fetch_hourly(OPEN_METEO_URL, params, city["name"], timeout)
-
-
-def fetch_archive(city: dict, start_date: str, end_date: str, timeout: int = 20) -> list[dict] | None:
-    """Tryb --start/--end: jawny zakres dat z Historical Weather API (reanaliza ERA5)."""
-    params = {
-        "latitude": city["lat"],
-        "longitude": city["lon"],
-        "start_date": start_date,
-        "end_date": end_date,
-        "hourly": ",".join(HOURLY_VARS),
-        "timezone": "GMT",
-    }
-    return _fetch_hourly(ARCHIVE_URL, params, city["name"], timeout)
 
 
 def _to_int(v):
@@ -158,41 +121,85 @@ def _kmh_to_ms(v):
         return None
 
 
-def _parse_date(value: str) -> date:
-    """Waliduje format YYYY-MM-DD; przy błędzie argparse pokaże czytelny komunikat."""
+def _hourly_to_rows(hourly: dict, cutoff: str | None = None) -> list[dict]:
+    """Mapuje blok `hourly` z odpowiedzi Open-Meteo na wiersze do tabeli measurements.
+
+    Pomijamy godziny bez danych (None w temperature_2m) oraz godziny późniejsze
+    niż `cutoff` (ISO UTC) — to prognoza na resztę doby, nie zapis przeszłości.
+    Timestampy ISO porównują się poprawnie jako tekst (sortowanie leksykalne).
+    """
+    times = hourly.get("time") or []
+    rows: list[dict] = []
+    for i, t in enumerate(times):
+        def at(key: str):
+            arr = hourly.get(key) or []
+            return arr[i] if i < len(arr) else None
+
+        ts = _normalize_ts(t)
+        if cutoff is not None and ts > cutoff:
+            continue
+        if at("temperature_2m") is None:
+            continue
+
+        wcode = at("weathercode")
+        rows.append({
+            "timestamp": ts,
+            "temp_c": at("temperature_2m"),
+            "feels_like_c": at("apparent_temperature"),
+            "temp_min_c": None,
+            "temp_max_c": None,
+            "humidity_pct": _to_int(at("relativehumidity_2m")),
+            "pressure_hpa": _to_int(at("pressure_msl")),
+            "wind_speed_ms": _kmh_to_ms(at("windspeed_10m")),
+            "wind_deg": _to_int(at("winddirection_10m")),
+            "clouds_pct": _to_int(at("cloudcover")),
+            "weather_main": _wmo_to_main(int(wcode)) if wcode is not None else None,
+            "weather_desc": _wmo_to_desc(int(wcode)) if wcode is not None else None,
+            "source": "open_meteo",
+        })
+    return rows
+
+
+def fetch_history(city: dict, past_days: int, cutoff: str, timeout: int = 20) -> list[dict] | None:
+    """Pobiera ostatnie `past_days` dni dla miasta. Zwraca wiersze albo None przy błędzie."""
+    params = {
+        "latitude": city["lat"],
+        "longitude": city["lon"],
+        "past_days": past_days,
+        "forecast_days": 1,
+        "hourly": ",".join(HOURLY_VARS),
+        "timezone": "GMT",
+    }
     try:
-        return datetime.strptime(value, "%Y-%m-%d").date()
-    except ValueError:
-        raise argparse.ArgumentTypeError(
-            f"niepoprawna data: {value!r} — oczekiwany format YYYY-MM-DD, np. 2026-05-28"
-        )
+        resp = requests.get(OPEN_METEO_URL, params=params, timeout=timeout)
+        resp.raise_for_status()
+        payload = resp.json()
+    except requests.RequestException as exc:
+        logger.warning("HTTP fail for %s: %s", city["name"], exc)
+        return None
+    except ValueError as exc:
+        logger.warning("Bad JSON for %s: %s", city["name"], exc)
+        return None
+    return _hourly_to_rows(payload.get("hourly") or {}, cutoff=cutoff)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Backfill historii pogody. Tryb główny: --start/--end (archiwum ERA5)."
+        description="Logowanie historii pogody z Open-Meteo do bazy SQLite."
     )
-    parser.add_argument("--start", type=_parse_date, default=None,
-                        help="początek zakresu YYYY-MM-DD (Historical Weather API)")
-    parser.add_argument("--end", type=_parse_date, default=None,
-                        help="koniec zakresu YYYY-MM-DD (Historical Weather API)")
     parser.add_argument("--days", type=int, default=14,
-                        help="alternatywa: ile dni wstecz z /v1/forecast (max 92)")
-    parser.add_argument("--sleep", type=float, default=0.3, help="seconds between API calls")
+                        help="ile dni wstecz pobrać (1..92, domyślnie 14)")
+    parser.add_argument("--sleep", type=float, default=0.3,
+                        help="pauza w sekundach między miastami (nie przeciążamy API)")
     args = parser.parse_args()
-
-    use_archive = args.start is not None or args.end is not None
-    if use_archive:
-        if args.start is None or args.end is None:
-            parser.error("--start i --end muszą być podane razem")
-        if args.start > args.end:
-            parser.error(f"--start ({args.start}) musi być <= --end ({args.end})")
-    elif not 1 <= args.days <= 92:
+    if not 1 <= args.days <= 92:
         parser.error("--days must be in 1..92")
 
     config = load_config()
     db_path = PROJECT_ROOT / config.get("database", {}).get("path", "data/weather.db")
     cities = config["collection"]["cities"]
+    # Odcinamy godziny z przyszłości względem chwili startu skryptu.
+    cutoff = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     conn = get_connection(db_path)
     total_inserted = 0
@@ -210,10 +217,7 @@ def main() -> None:
                 failed_names.append(city["name"])
                 continue
 
-            if use_archive:
-                rows = fetch_archive(city, args.start.isoformat(), args.end.isoformat())
-            else:
-                rows = fetch_history(city, args.days)
+            rows = fetch_history(city, args.days, cutoff)
             if rows is None:
                 cities_failed += 1
                 failed_names.append(city["name"])
@@ -233,15 +237,11 @@ def main() -> None:
                         "[backfill]", city["name"], city["country"], len(rows), ins, dup)
             time.sleep(args.sleep)
 
-        if use_archive:
-            source_used = f"open_meteo_archive ({args.start}..{args.end})"
-        else:
-            source_used = f"open_meteo_archive (past_days={args.days})"
         log_collection_run(
             conn,
             cities_ok=cities_ok,
             cities_failed=cities_failed,
-            source_used=source_used,
+            source_used=f"open_meteo (past_days={args.days})",
             notes=f"backfill: inserted={total_inserted} dup={total_dup}"
                   + (f" failed={','.join(failed_names)}" if failed_names else ""),
         )

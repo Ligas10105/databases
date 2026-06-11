@@ -38,7 +38,7 @@ CREATE TABLE IF NOT EXISTS measurements (
     clouds_pct INTEGER,
     weather_main TEXT,
     weather_desc TEXT,
-    source TEXT DEFAULT 'owm',
+    source TEXT DEFAULT 'open_meteo',
     UNIQUE(city_id, timestamp)
 );
 

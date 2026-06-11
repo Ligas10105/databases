@@ -1,13 +1,12 @@
-# Weather System — zbieranie i wizualizacja danych pogodowych
+# Weather System — logowanie i wizualizacja danych pogodowych
 
-Kolektor pobiera co 30 minut pogodę dla 20 europejskich miast
-(OpenWeatherMap, z fallbackiem do Open-Meteo), zapisuje do SQLite,
-a dashboard Streamlit pokazuje wykresy, statystyki i mapę.
+Skrypt loguje godzinowe dane pogodowe dla 20 europejskich miast z API
+Open-Meteo do bazy SQLite, a dashboard Streamlit prezentuje je w trzech
+widokach: szeregi czasowe, analiza ilościowa i mapa — każdy z 6 filtrami.
 
 ## Wymagania
 
-- Python 3.10+
-- (opcjonalnie) klucz API OpenWeatherMap — bez niego system korzysta z Open-Meteo
+- Python 3.10+ (nic więcej — Open-Meteo nie wymaga klucza API)
 
 ## Instalacja (raz)
 
@@ -15,9 +14,6 @@ a dashboard Streamlit pokazuje wykresy, statystyki i mapę.
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-
-# opcjonalnie: klucz OWM
-echo "OWM_API_KEY=twoj_klucz" > .env
 ```
 
 ## Uruchomienie
@@ -26,18 +22,17 @@ echo "OWM_API_KEY=twoj_klucz" > .env
 # 1. Utworzenie bazy + wstawienie miast (raz)
 python scripts/init_db.py
 
-# 2. Zasilenie historią ~2 tygodni (archiwum ERA5 bywa opóźnione 2-5 dni,
-#    więc --end ustaw kilka dni wstecz)
-python scripts/backfill.py --start 2026-05-28 --end 2026-06-08
+# 2. Zalogowanie danych — ostatnie 14 dni co godzinę
+python scripts/backfill.py --days 14
 
-# 3. Kolektor na żywo — zostaw włączony (terminal 1)
-python -m collector.scheduler
-
-# 4. Dashboard (terminal 2)
+# 3. Dashboard
 streamlit run dashboard/app.py
 ```
 
 Dashboard otworzy się pod http://localhost:8501.
+
+Krok 2 można powtarzać (np. przed prezentacją) — skrypt dokleja tylko nowe
+godziny, duplikaty pomija.
 
 ## Testy
 

@@ -15,7 +15,7 @@ def render(db_path: str, filters: dict) -> None:
     # dla każdego miasta pokazujemy najnowszy pomiar mieszczący się w filtrach.
     df = load_latest_per_city_filtered(db_path, filters)
     if df.empty:
-        st.info("No data matching the current filters — adjust the sidebar or start the collector.")
+        st.info("No data matching the current filters — adjust the sidebar or run the backfill.")
         return
 
     parameter = filters.get("parameter", "temperature")

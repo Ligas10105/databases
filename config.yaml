@@ -1,5 +1,4 @@
 collection:
-  interval_minutes: 30
   cities:
     - {name: Warsaw, country: PL, lat: 52.23, lon: 21.01}
     - {name: Krakow, country: PL, lat: 50.06, lon: 19.94}
@@ -21,12 +20,6 @@ collection:
     - {name: Copenhagen, country: DK, lat: 55.68, lon: 12.57}
     - {name: Helsinki, country: FI, lat: 60.17, lon: 24.94}
     - {name: Zurich, country: CH, lat: 47.38, lon: 8.54}
-
-api:
-  openweathermap_base: https://api.openweathermap.org/data/2.5/weather
-  open_meteo_base: https://api.open-meteo.com/v1/forecast
-  timeout_seconds: 10
-  retry_attempts: 3
 
 database:
   path: data/weather.db

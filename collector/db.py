@@ -1,4 +1,4 @@
-"""SQLite connection and write helpers for the collector."""
+"""Połączenie z SQLite i funkcje zapisu (używane przez backfill i init_db)."""
 from __future__ import annotations
 
 import sqlite3

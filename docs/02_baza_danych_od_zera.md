@@ -61,20 +61,22 @@ CREATE TABLE IF NOT EXISTS measurements (
     timestamp TEXT NOT NULL,
     temp_c REAL,
     ...
-    source TEXT DEFAULT 'owm',
+    source TEXT DEFAULT 'open_meteo',
     UNIQUE(city_id, timestamp)
 );
 ```
 
 Jeden wiersz = jeden odczyt pogody dla jednego miasta o jednej godzinie.
 Zamiast nazwy miasta trzymamy `city_id` — numer wiersza z tabeli `cities`
-(dlaczego — patrz punkt o kluczu obcym). Kolumna `source` mówi, skąd przyszły
-dane: `owm`, `open_meteo` albo `open_meteo_archive` (backfill).
+(dlaczego — patrz punkt o kluczu obcym). Kolumna `source` mówi, skąd przyszedł
+rekord (u nas: `open_meteo`). To dobra praktyka zwana *pochodzeniem danych*
+(data provenance) — gdyby kiedyś doszło drugie źródło, od razu widać, co skąd
+jest, i można porównywać źródła jednym `GROUP BY source`.
 
-### `collection_log` — dziennik pracy kolektora
+### `collection_log` — dziennik logowania danych
 
-Po każdym przebiegu zbierania zapisujemy: kiedy, ile miast się udało, ile
-padło, z jakich źródeł. To nie są dane pogodowe, tylko "czarna skrzynka" do
+Po każdym przebiegu backfillu zapisujemy: kiedy, ile miast się udało, ile
+padło, ile wierszy weszło. To nie są dane pogodowe, tylko "czarna skrzynka" do
 diagnozowania problemów. Wpisy robi `log_collection_run()` w `collector/db.py`.
 
 ---
@@ -164,17 +166,18 @@ CREATE INDEX idx_measurements_time      ON measurements(timestamp);
   (`timestamp >= ? AND timestamp <= ?`), gdy pytamy o wszystkie miasta naraz.
 
 Koszt: indeks zajmuje miejsce i odrobinę spowalnia `INSERT` (trzeba dopisać
-wpis do skorowidzu). Przy naszym ruchu (40 insertów na pół godziny) to
-pomijalne, a odczyty dashboardu są dzięki temu natychmiastowe.
+wpis do skorowidzu). Przy naszej skali (backfill wstawia kilka tysięcy wierszy
+w parę sekund) to pomijalne, a odczyty dashboardu są dzięki temu natychmiastowe.
 
 ---
 
 ## 7. Tryb WAL — czytanie i pisanie jednocześnie
 
-**Problem:** u nas jednocześnie działają **dwa programy**: kolektor (pisze do
-bazy co 30 min) i dashboard (czyta przy każdym odświeżeniu strony). W domyślnym
-trybie SQLite pisarz potrafi zablokować czytelników — dashboard dostawałby
-błąd "database is locked".
+**Problem:** do bazy może jednocześnie sięgać **dwóch klientów**: backfill
+(pisze, gdy odświeżamy dane) i dashboard (czyta przy każdym przeładowaniu
+strony) — np. dogrywasz świeże godziny tuż przed prezentacją, nie zamykając
+dashboardu. W domyślnym trybie SQLite pisarz potrafi zablokować czytelników —
+dashboard dostawałby błąd "database is locked".
 
 **Rozwiązanie:** `PRAGMA journal_mode=WAL` (Write-Ahead Logging — "dziennik
 z wyprzedzeniem"). Po ludzku: zamiast nadpisywać główny plik bazy, pisarz
@@ -200,7 +203,7 @@ conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=30)
 `mode=ro` = *read-only*. Dashboard fizycznie **nie może** nic zapisać ani
 zmienić — każda próba skończy się błędem. Po co?
 
-1. **Podział ról:** jedynym pisarzem jest kolektor. Mniej pisarzy = mniej
+1. **Podział ról:** jedynym pisarzem jest backfill. Mniej pisarzy = mniej
    konfliktów i prostsze rozumowanie o systemie.
 2. **Bezpieczeństwo:** błąd w kodzie dashboardu (albo złośliwe dane w filtrze)
    nie ma prawa uszkodzić ani zmodyfikować danych.

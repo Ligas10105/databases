@@ -128,7 +128,7 @@ def main() -> None:
     if not Path(db_path).exists():
         st.error(
             f"Database not found at `{db_path}`. "
-            "Run `python scripts/init_db.py` first, then start the collector."
+            "Run `python scripts/init_db.py` first, then `python scripts/backfill.py --days 14`."
         )
         return
 

@@ -2,120 +2,120 @@
 
 ## Co system robi i po co
 
-System zbiera dane pogodowe dla 20 europejskich miast (lista w `config.yaml`),
-zapisuje je do lokalnej bazy SQLite i prezentuje na interaktywnym dashboardzie.
-Kolektor działa w tle i co 30 minut pobiera aktualną pogodę z API
-OpenWeatherMap (a gdy ono zawiedzie — z Open-Meteo). Dashboard w Streamlit
-pokazuje te dane na trzy sposoby: wykresy w czasie, statystyki i mapę Europy.
-Dodatkowo skrypt `scripts/backfill.py` potrafi jednorazowo zasilić bazę
-prawdziwą historią pogody (np. 2 tygodnie wstecz), żeby było co pokazywać
-od razu, bez czekania aż kolektor nazbiera dane.
+System loguje dane pogodowe dla 20 europejskich miast (lista w `config.yaml`)
+do własnej bazy SQLite i prezentuje je na interaktywnym dashboardzie.
+Dane pobiera skrypt `scripts/backfill.py` z API Open-Meteo — jedno uruchomienie
+ściąga historię godzinową z ostatnich N dni (domyślnie 14) i wstawia ją do bazy;
+ponowne uruchomienie dokleja tylko nowe godziny. Dashboard w Streamlit pokazuje
+dane na trzy sposoby: wykresy w czasie (time series), statystyki (analiza
+ilościowa) i mapę Europy (analiza przestrzenna) — każdy widok z 6 wspólnymi
+filtrami.
+
+Tak realizujemy wymagania projektu: *logowanie danych ze źródła online do
+własnej bazy* + *system wizualizacji ze statystyką i min. jedną z trzech
+kategorii* (mamy wszystkie trzy) + *min. 5 sposobów filtrowania na widok*.
 
 ## Przepływ danych — krok po kroku
 
 ```
-API pogodowe (OWM / Open-Meteo)
-        │  HTTP GET, odpowiedź JSON
+ŹRÓDŁO    Open-Meteo API (api.open-meteo.com/v1/forecast, past_days=N)
+        │  HTTP GET, odpowiedź JSON z blokiem hourly
         ▼
-KOLEKTOR  collector/api_client.py  →  collector/db.py
-        │  znormalizowany słownik → INSERT do SQLite
+LOGGER    scripts/backfill.py  →  collector/db.py
+        │  mapowanie na wiersze → INSERT OR IGNORE do SQLite
         ▼
-BAZA      data/weather.db (SQLite, 3 tabele)
+BAZA      data/weather.db (SQLite, 3 tabele: cities, measurements, collection_log)
         │  zapytania SELECT (tylko odczyt)
         ▼
 DASHBOARD dashboard/data_loader.py  →  dashboard/views/*.py
-        │  pandas DataFrame → wykresy/mapa
+        │  pandas DataFrame → wykresy / statystyki / mapa
         ▼
-PRZEGLĄDARKA (Streamlit)
+PRZEGLĄDARKA (Streamlit, localhost:8501)
 ```
 
 Wyjaśnienie każdego kroku:
 
-1. **API → kolektor.** Funkcja `fetch_owm()` w `collector/api_client.py` wysyła
-   zapytanie HTTP do OpenWeatherMap i dostaje JSON z aktualną pogodą. Odpowiedź
-   jest od razu **normalizowana** — czyli przerabiana na jeden wspólny format
-   słownika (klucze: `temp_c`, `humidity_pct`, `timestamp` itd.), niezależnie
-   z którego API przyszła. Dzięki temu reszta systemu nie musi wiedzieć, skąd
-   pochodzą dane.
-2. **Fallback.** Jeśli OWM zwróci błąd (np. brak klucza, limit zapytań),
-   `fetch_owm()` zwraca `None`, a scheduler próbuje `fetch_open_meteo()` —
-   darmowego API bez klucza. System nie crashuje, tylko po cichu zmienia źródło.
-3. **Kolektor → baza.** `collector/db.py` otwiera połączenie do SQLite
-   (`get_connection`) i wstawia pomiar (`insert_measurement`). Duplikaty
-   (ten sam pomiar dwa razy) są automatycznie pomijane.
+1. **Źródło → logger.** `fetch_history()` w `scripts/backfill.py` wysyła dla
+   każdego miasta jedno zapytanie HTTP do Open-Meteo z parametrem
+   `past_days=N` — odpowiedź to JSON z tablicami godzinowymi (czas,
+   temperatura, wilgotność, ciśnienie, wiatr, zachmurzenie, kod pogody).
+2. **Normalizacja.** `_hourly_to_rows()` przerabia odpowiedź na wiersze
+   pasujące do naszej tabeli: km/h → m/s, kod pogody WMO → kategoria tekstowa
+   ("Rain", "Clouds"...), czas → ISO UTC. Godziny z przyszłości (API dorzuca
+   prognozę na resztę doby) są odcinane — logujemy tylko przeszłość.
+3. **Logger → baza.** `collector/db.py` wstawia wiersze przez
+   `INSERT OR IGNORE` — duplikaty (godziny, które już są w bazie) są pomijane,
+   więc skrypt można odpalać codziennie i baza tylko przyrasta.
+   Podsumowanie każdego przebiegu ląduje w tabeli `collection_log`.
 4. **Baza → dashboard.** Wszystkie zapytania SQL dashboardu mieszkają w jednym
-   pliku: `dashboard/data_loader.py`. Strony dashboardu (`views/`) nie piszą
-   SQL-a same — proszą data_loader o gotowe dane w formie tabel pandas.
+   pliku: `dashboard/data_loader.py`. Widoki (`views/`) nie piszą SQL-a same —
+   dostają gotowe tabele pandas. Dashboard łączy się z bazą **tylko do odczytu**.
 5. **Dashboard → użytkownik.** `dashboard/app.py` rysuje pasek filtrów
-   i trzy zakładki; każda zakładka dostaje te same filtry i te same dane.
+   i trzy zakładki; każda zakładka dostaje ten sam słownik filtrów.
 
 ## Rola każdego pliku
 
 | Plik | Za co odpowiada |
 |---|---|
-| `config.yaml` | Konfiguracja: lista 20 miast, interwał zbierania (30 min), adresy API, ścieżka do bazy (`database.path`) |
-| `.env` | Klucz API do OpenWeatherMap (`OWM_API_KEY`) — nigdy nie trafia do gita |
+| `config.yaml` | Konfiguracja: lista 20 miast (nazwa, kraj, współrzędne) i ścieżka do bazy (`database.path`) |
 | `scripts/init_db.py` | Jednorazowe utworzenie bazy: 3 tabele + 2 indeksy + wstawienie 20 miast |
-| `scripts/backfill.py` | Jednorazowe zasilenie bazy historią pogody (godzinową) z archiwum Open-Meteo; tryb główny `--start/--end` |
-| `collector/api_client.py` | Klienci HTTP: `fetch_owm()` (główne źródło) i `fetch_open_meteo()` (zapasowe); normalizacja odpowiedzi do wspólnego słownika |
-| `collector/db.py` | Warstwa zapisu do bazy: połączenie (WAL), `insert_measurement` (z odsiewaniem duplikatów), `log_collection_run` |
-| `collector/scheduler.py` | Punkt startowy kolektora: APScheduler odpala `collect_all_cities()` co 30 min; logika fallbacku OWM→Open-Meteo |
+| `scripts/backfill.py` | Logowanie danych: pobiera historię godzinową z Open-Meteo i wstawia do bazy |
+| `collector/db.py` | Warstwa zapisu: połączenie (tryb WAL), `insert_measurement` (z odsiewaniem duplikatów), `log_collection_run` |
 | `dashboard/app.py` | Punkt startowy dashboardu: pasek filtrów (sidebar) + 3 zakładki |
 | `dashboard/data_loader.py` | WSZYSTKIE zapytania SQL dashboardu; wspólny budowniczy filtrów `_build_where()` |
 | `dashboard/views/time_series.py` | Zakładka 1: wykres liniowy parametru w czasie (Plotly) |
 | `dashboard/views/quantitative.py` | Zakładka 2: statystyki (min/max/średnia/odchylenie), histogram, box plot |
 | `dashboard/views/spatial.py` | Zakładka 3: mapa Folium — marker per miasto z najnowszym pomiarem + heatmapa |
-| `tests/test_db.py`, `tests/test_api_client.py` | Testy: baza w pamięci + zamockowane odpowiedzi HTTP |
+| `tests/test_db.py`, `tests/test_backfill.py` | Testy: baza w pamięci/pliku tymczasowym + parser odpowiedzi API |
 
-## Jak działa kolektor (`collector/scheduler.py`)
+## Jak działa backfill (`scripts/backfill.py`)
 
-1. Przy starcie wczytuje `.env` (klucz API) i `config.yaml` (miasta, interwał).
-2. Wykonuje **od razu** jedno zbieranie (`collect_all_cities()`), a potem
-   ustawia w APSchedulerze zadanie cykliczne co `interval_minutes` (30 min).
-3. `collect_all_cities()` dla każdego z 20 miast:
-   - próbuje `fetch_owm(city, api_key)` — jeśli zwróci `None` (błąd HTTP,
-     brak klucza), próbuje `fetch_open_meteo(city)`;
-   - jeśli oba zawiodą — miasto jest pomijane (licznik `failed`), program
-     działa dalej;
-   - wstawia pomiar do bazy; jeśli identyczny timestamp już jest — loguje `DUP`.
-4. Po przejściu wszystkich miast zapisuje podsumowanie do tabeli
-   `collection_log` (ile miast OK, ile padło, z jakich źródeł dane).
+1. Wczytuje `config.yaml` (miasta, ścieżka bazy) i zapamiętuje bieżący czas
+   UTC jako granicę (cutoff) odcinania przyszłych godzin.
+2. Dla każdego z 20 miast: jedno zapytanie HTTP → mapowanie na wiersze →
+   `INSERT OR IGNORE`. Loguje per miasto: ile wierszy pobrano, ile wstawiono,
+   ile było duplikatów. Między miastami krótka pauza (`--sleep`), żeby nie
+   zalewać API.
+3. Jeśli zapytanie dla miasta padnie — miasto jest pomijane (licznik failed),
+   skrypt działa dalej; przy następnym uruchomieniu uzupełni braki.
+4. Na końcu wpis do `collection_log`: ile miast OK / failed, ile wierszy weszło.
 
 ## Jak działa dashboard (`dashboard/app.py`)
 
-- **Wspólny pasek filtrów** budowany w `_build_sidebar()`: zakres dat
-  (domyślnie ostatnie 7 dni), multiselect miast, wybór parametru (temperatura,
-  wilgotność, ciśnienie, wiatr, zachmurzenie...), suwak zakresu wartości,
-  poziom agregacji (raw/godzinowa/dzienna/tygodniowa) i warunki pogodowe
-  (Clear, Rain...). Wynik to jeden słownik `filters`, przekazywany do
-  **wszystkich trzech zakładek** — dlatego każdy widok filtruje identycznie.
+- **Wspólny pasek filtrów** budowany w `_build_sidebar()` — 6 filtrów:
+  1. zakres dat (domyślnie ostatnie 7 dni),
+  2. multiselect miast,
+  3. wybór parametru (temperatura, odczuwalna, wilgotność, ciśnienie, wiatr, zachmurzenie),
+  4. suwak zakresu wartości,
+  5. poziom agregacji (raw / godzinowa / dzienna / tygodniowa),
+  6. warunki pogodowe (Clear, Rain, Clouds...).
+
+  Wynik to jeden słownik `filters`, przekazywany do **wszystkich trzech
+  zakładek** — dlatego każdy widok filtruje identycznie (klauzulę WHERE buduje
+  jedna wspólna funkcja `_build_where()` w `data_loader.py`).
 - **Zakładki** (`st.tabs`):
   1. *Time Series* — przebieg parametru w czasie, kolor = miasto.
   2. *Statistics* — tabela statystyk per miasto, histogram, box plot.
   3. *Map* — mapa Europy; dla każdego miasta najnowszy pomiar **mieszczący się
-     w filtrach** (funkcja `load_latest_per_city_filtered`), marker z popupem
+     w filtrach** (`load_latest_per_city_filtered`), marker z popupem
      i warstwa heatmapy.
-- Dashboard łączy się z bazą **tylko do odczytu** — nigdy nie pisze.
 
 ## Uruchomienie krok po kroku
 
 ```bash
 # 0. Zależności (raz)
-python -m venv .venv && source .venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
 # 1. Utworzenie bazy + wstawienie 20 miast (raz)
 python scripts/init_db.py
 
-# 2a. Zasilenie historią (np. 2 tygodnie, archiwum bywa opóźnione 2-5 dni)
-python scripts/backfill.py --start 2026-05-28 --end 2026-06-08
+# 2. Zalogowanie danych — ostatnie 14 dni co godzinę
+python scripts/backfill.py --days 14
 
-# 2b. ...i/lub zbieranie na żywo co 30 min (zostawić włączone)
-python -m collector.scheduler
-
-# 3. Dashboard (w drugim terminalu)
+# 3. Dashboard
 streamlit run dashboard/app.py
 ```
 
-Backfill i kolektor mogą działać równolegle z dashboardem — patrz tryb WAL
-w `docs/02_baza_danych_od_zera.md`.
+Przed prezentacją wystarczy powtórzyć krok 2 — skrypt doklei brakujące godziny
+(duplikaty pominie), więc mapa "latest readings" pokaże dane z ostatniej godziny.
