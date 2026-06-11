@@ -1,7 +1,14 @@
-"""Backfill historical hourly weather from Open-Meteo into the measurements table.
+"""Backfill — zasilenie bazy prawdziwą historią pogody (rozdzielczość godzinowa).
 
-Uses /v1/forecast with past_days (up to 92). Default 14 days.
-Run:  python scripts/backfill.py [--days N]
+Dwa tryby:
+  --start/--end  (GŁÓWNY) — Open-Meteo Historical Weather API (reanaliza ERA5),
+                 jawny zakres dat YYYY-MM-DD. Uwaga: archiwum bywa opóźnione
+                 o ok. 2-5 dni, najświeższe godziny mogą być puste — to normalne.
+  --days N       (alternatywa) — /v1/forecast z past_days (max 92 dni wstecz).
+
+Uruchomienie:
+  python scripts/backfill.py --start 2026-05-28 --end 2026-06-08
+  python scripts/backfill.py --days 14
 """
 from __future__ import annotations
 
@@ -9,6 +16,7 @@ import argparse
 import logging
 import sys
 import time
+from datetime import date, datetime
 from pathlib import Path
 
 import requests
@@ -27,6 +35,7 @@ logging.basicConfig(
 logger = logging.getLogger("backfill")
 
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 HOURLY_VARS = [
     "temperature_2m",
     "apparent_temperature",
@@ -53,36 +62,23 @@ def _normalize_ts(t: str) -> str:
     return t + "Z"
 
 
-def fetch_history(city: dict, past_days: int, timeout: int = 20) -> list[dict] | None:
-    params = {
-        "latitude": city["lat"],
-        "longitude": city["lon"],
-        "past_days": past_days,
-        "forecast_days": 1,
-        "hourly": ",".join(HOURLY_VARS),
-        "timezone": "GMT",
-    }
-    try:
-        resp = requests.get(OPEN_METEO_URL, params=params, timeout=timeout)
-        resp.raise_for_status()
-        payload = resp.json()
-    except requests.RequestException as exc:
-        logger.warning("HTTP fail for %s: %s", city["name"], exc)
-        return None
-    except ValueError as exc:
-        logger.warning("Bad JSON for %s: %s", city["name"], exc)
-        return None
+def _hourly_to_rows(hourly: dict) -> list[dict]:
+    """Mapuje blok `hourly` z odpowiedzi Open-Meteo na wiersze do tabeli measurements.
 
-    hourly = payload.get("hourly") or {}
+    Wspólne dla obu trybów (forecast z past_days oraz archive) — oba API
+    zwracają identyczną strukturę: time[], temperature_2m[], itd.
+    Godziny bez danych (None w temperature_2m — np. opóźnienie archiwum ERA5)
+    są pomijane, nie traktujemy ich jako błąd.
+    """
     times = hourly.get("time") or []
-    if not times:
-        return []
-
     rows: list[dict] = []
     for i, t in enumerate(times):
         def at(key: str):
             arr = hourly.get(key) or []
             return arr[i] if i < len(arr) else None
+
+        if at("temperature_2m") is None:
+            continue
 
         wcode = at("weathercode")
         rows.append({
@@ -103,6 +99,47 @@ def fetch_history(city: dict, past_days: int, timeout: int = 20) -> list[dict] |
     return rows
 
 
+def _fetch_hourly(url: str, params: dict, city_name: str, timeout: int) -> list[dict] | None:
+    """Wspólny GET + parsowanie. Zwraca wiersze, [] gdy brak danych, None przy błędzie."""
+    try:
+        resp = requests.get(url, params=params, timeout=timeout)
+        resp.raise_for_status()
+        payload = resp.json()
+    except requests.RequestException as exc:
+        logger.warning("HTTP fail for %s: %s", city_name, exc)
+        return None
+    except ValueError as exc:
+        logger.warning("Bad JSON for %s: %s", city_name, exc)
+        return None
+    return _hourly_to_rows(payload.get("hourly") or {})
+
+
+def fetch_history(city: dict, past_days: int, timeout: int = 20) -> list[dict] | None:
+    """Tryb --days: ostatnie N dni z /v1/forecast (past_days)."""
+    params = {
+        "latitude": city["lat"],
+        "longitude": city["lon"],
+        "past_days": past_days,
+        "forecast_days": 1,
+        "hourly": ",".join(HOURLY_VARS),
+        "timezone": "GMT",
+    }
+    return _fetch_hourly(OPEN_METEO_URL, params, city["name"], timeout)
+
+
+def fetch_archive(city: dict, start_date: str, end_date: str, timeout: int = 20) -> list[dict] | None:
+    """Tryb --start/--end: jawny zakres dat z Historical Weather API (reanaliza ERA5)."""
+    params = {
+        "latitude": city["lat"],
+        "longitude": city["lon"],
+        "start_date": start_date,
+        "end_date": end_date,
+        "hourly": ",".join(HOURLY_VARS),
+        "timezone": "GMT",
+    }
+    return _fetch_hourly(ARCHIVE_URL, params, city["name"], timeout)
+
+
 def _to_int(v):
     if v is None:
         return None
@@ -121,12 +158,36 @@ def _kmh_to_ms(v):
         return None
 
 
+def _parse_date(value: str) -> date:
+    """Waliduje format YYYY-MM-DD; przy błędzie argparse pokaże czytelny komunikat."""
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"niepoprawna data: {value!r} — oczekiwany format YYYY-MM-DD, np. 2026-05-28"
+        )
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--days", type=int, default=14, help="how many past days to fetch (max 92)")
+    parser = argparse.ArgumentParser(
+        description="Backfill historii pogody. Tryb główny: --start/--end (archiwum ERA5)."
+    )
+    parser.add_argument("--start", type=_parse_date, default=None,
+                        help="początek zakresu YYYY-MM-DD (Historical Weather API)")
+    parser.add_argument("--end", type=_parse_date, default=None,
+                        help="koniec zakresu YYYY-MM-DD (Historical Weather API)")
+    parser.add_argument("--days", type=int, default=14,
+                        help="alternatywa: ile dni wstecz z /v1/forecast (max 92)")
     parser.add_argument("--sleep", type=float, default=0.3, help="seconds between API calls")
     args = parser.parse_args()
-    if not 1 <= args.days <= 92:
+
+    use_archive = args.start is not None or args.end is not None
+    if use_archive:
+        if args.start is None or args.end is None:
+            parser.error("--start i --end muszą być podane razem")
+        if args.start > args.end:
+            parser.error(f"--start ({args.start}) musi być <= --end ({args.end})")
+    elif not 1 <= args.days <= 92:
         parser.error("--days must be in 1..92")
 
     config = load_config()
@@ -149,7 +210,10 @@ def main() -> None:
                 failed_names.append(city["name"])
                 continue
 
-            rows = fetch_history(city, args.days)
+            if use_archive:
+                rows = fetch_archive(city, args.start.isoformat(), args.end.isoformat())
+            else:
+                rows = fetch_history(city, args.days)
             if rows is None:
                 cities_failed += 1
                 failed_names.append(city["name"])
@@ -169,11 +233,15 @@ def main() -> None:
                         "[backfill]", city["name"], city["country"], len(rows), ins, dup)
             time.sleep(args.sleep)
 
+        if use_archive:
+            source_used = f"open_meteo_archive ({args.start}..{args.end})"
+        else:
+            source_used = f"open_meteo_archive (past_days={args.days})"
         log_collection_run(
             conn,
             cities_ok=cities_ok,
             cities_failed=cities_failed,
-            source_used=f"open_meteo_archive (past_days={args.days})",
+            source_used=source_used,
             notes=f"backfill: inserted={total_inserted} dup={total_dup}"
                   + (f" failed={','.join(failed_names)}" if failed_names else ""),
         )

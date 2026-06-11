@@ -6,14 +6,16 @@ import streamlit as st
 from folium.plugins import HeatMap
 from streamlit_folium import folium_static
 
-from dashboard.data_loader import PARAM_COLUMNS, load_latest_per_city
+from dashboard.data_loader import PARAM_COLUMNS, load_latest_per_city_filtered
 
 
 def render(db_path: str, filters: dict) -> None:
     st.subheader("Map — latest readings")
-    df = load_latest_per_city(db_path)
+    # Mapa respektuje te same filtry paska bocznego co pozostałe zakładki:
+    # dla każdego miasta pokazujemy najnowszy pomiar mieszczący się w filtrach.
+    df = load_latest_per_city_filtered(db_path, filters)
     if df.empty:
-        st.info("No data yet — start the collector to populate the database.")
+        st.info("No data matching the current filters — adjust the sidebar or start the collector.")
         return
 
     parameter = filters.get("parameter", "temperature")

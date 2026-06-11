@@ -41,20 +41,16 @@ def list_weather_conditions(db_path: str | Path) -> list[str]:
     return [r[0] for r in rows]
 
 
-def load_measurements(db_path: str | Path, filters: dict) -> pd.DataFrame:
-    """Load measurements with optional filtering and aggregation.
+def _build_where(filters: dict) -> tuple[str, list]:
+    """Buduje klauzulę WHERE i listę parametrów z filtrów paska bocznego.
 
-    filters keys:
-      - start (ISO str), end (ISO str)
-      - city_ids: iterable[int]
-      - parameter: one of PARAM_COLUMNS keys (used for value-range filter only)
-      - value_min, value_max: floats
-      - weather_conditions: iterable[str]
-      - aggregation: 'raw' | 'hourly' | 'daily' | 'weekly'
+    Wspólne dla load_measurements i load_latest_per_city_filtered —
+    dzięki temu wszystkie widoki filtrują identycznie. Warunki odnoszą się
+    do tabeli measurements pod aliasem `m`.
+
+    Zwraca: (where_sql, params), gdzie where_sql to "WHERE ..." albo "".
     """
-    parameter = filters.get("parameter", "temperature")
-    column = PARAM_COLUMNS.get(parameter, "temp_c")
-    aggregation = filters.get("aggregation", "raw")
+    column = PARAM_COLUMNS.get(filters.get("parameter", "temperature"), "temp_c")
 
     where: list[str] = []
     params: list = []
@@ -88,6 +84,22 @@ def load_measurements(db_path: str | Path, filters: dict) -> pd.DataFrame:
             params.extend(conditions)
 
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    return where_sql, params
+
+
+def load_measurements(db_path: str | Path, filters: dict) -> pd.DataFrame:
+    """Load measurements with optional filtering and aggregation.
+
+    filters keys:
+      - start (ISO str), end (ISO str)
+      - city_ids: iterable[int]
+      - parameter: one of PARAM_COLUMNS keys (used for value-range filter only)
+      - value_min, value_max: floats
+      - weather_conditions: iterable[str]
+      - aggregation: 'raw' | 'hourly' | 'daily' | 'weekly'
+    """
+    aggregation = filters.get("aggregation", "raw")
+    where_sql, params = _build_where(filters)
 
     if aggregation == "raw":
         query = f"""
@@ -169,6 +181,39 @@ def load_latest_per_city(db_path: str | Path) -> pd.DataFrame:
     """
     with _connect(db_path) as conn:
         df = pd.read_sql_query(query, conn)
+    if not df.empty:
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
+    return df
+
+
+def load_latest_per_city_filtered(db_path: str | Path, filters: dict) -> pd.DataFrame:
+    """Najnowszy pomiar per miasto, ale TYLKO spośród rekordów spełniających filtry.
+
+    Te same warunki WHERE co load_measurements (wspólny _build_where).
+    Podzapytanie wybiera MAX(timestamp) per city_id z przefiltrowanego zbioru;
+    dzięki UNIQUE(city_id, timestamp) para (city_id, max_ts) wskazuje dokładnie
+    jeden rekord, więc filtrów nie trzeba powtarzać w zapytaniu zewnętrznym.
+    Zwraca te same kolumny co load_latest_per_city.
+    """
+    where_sql, params = _build_where(filters)
+    query = f"""
+        SELECT
+            c.id AS city_id, c.name AS city, c.country, c.lat, c.lon,
+            m.timestamp, m.temp_c, m.feels_like_c, m.humidity_pct,
+            m.pressure_hpa, m.wind_speed_ms, m.clouds_pct,
+            m.weather_main, m.weather_desc
+        FROM measurements m
+        JOIN cities c ON c.id = m.city_id
+        JOIN (
+            SELECT m.city_id AS cid, MAX(m.timestamp) AS max_ts
+            FROM measurements m
+            {where_sql}
+            GROUP BY m.city_id
+        ) latest ON latest.cid = m.city_id AND latest.max_ts = m.timestamp
+        ORDER BY c.name
+    """
+    with _connect(db_path) as conn:
+        df = pd.read_sql_query(query, conn, params=params)
     if not df.empty:
         df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
     return df
