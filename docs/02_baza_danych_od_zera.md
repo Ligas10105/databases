@@ -17,6 +17,15 @@ bo trzyma odnośnik do tabeli miast.
 **SQL** to język, którym rozmawiamy z bazą: `SELECT` czyta dane, `INSERT`
 wstawia, `CREATE TABLE` zakłada tabelę.
 
+> **ORM (SQLAlchemy).** W tym projekcie SQL-a zwykle **nie piszemy ręcznie** —
+> używamy biblioteki SQLAlchemy, która jest **ORM-em** (Object–Relational
+> Mapping, mapowanie obiektowo-relacyjne). ORM pozwala opisać tabele jako klasy
+> Pythona (np. klasa `City` ↔ tabela `cities`) i operować na obiektach zamiast
+> klepać napisy SQL. Zapytania budujemy funkcją `select(...)`, a ORM tłumaczy je
+> na SQL i wykonuje. **Pojęcia z tego dokumentu nadal obowiązują** — to dokładnie
+> ten SQL, który ORM generuje pod spodem; pokazujemy go, bo to jego trzeba
+> rozumieć. Modele (definicje tabel) są w `collector/models.py`.
+
 ### Po co SQLite?
 
 Większość baz (PostgreSQL, MySQL) to osobne **serwery** — programy działające
@@ -27,15 +36,22 @@ skonfigurować i utrzymywać. **SQLite to po prostu jeden plik na dysku**
 tysiącami wierszy to idealny wybór: cała "administracja bazą" to skopiowanie
 pliku.
 
-**Gdzie w kodzie:** `scripts/init_db.py` tworzy plik bazy i tabele;
+**Gdzie w kodzie:** `scripts/init_db.py` tworzy plik bazy i tabele
+(wywołując `Base.metadata.create_all` na modelach ORM);
 ścieżka do pliku jest w `config.yaml` (`database.path: data/weather.db`).
+Sam dostęp do bazy idzie przez SQLAlchemy (ORM), ale silnikiem pod spodem
+nadal jest wbudowany w Pythona sterownik `sqlite3` — dochodzi tylko jedna
+zależność (`pip install SQLAlchemy`).
 
 ---
 
 ## 2. Nasze trzy tabele
 
-Schemat (czyli definicje tabel) jest w jednym miejscu: stała `SCHEMA_SQL`
-w `scripts/init_db.py`.
+Schemat (czyli definicje tabel) jest w jednym miejscu: modele ORM w
+`collector/models.py` (klasy `City`, `Measurement`, `CollectionLog`).
+`init_db.py` zamienia te klasy na tabele przez `Base.metadata.create_all`.
+Poniżej dla jasności pokazujemy **SQL, który ORM z tych modeli generuje** —
+np. klasie `City` z polami `id`, `name`, `country`, `lat`, `lon` odpowiada:
 
 ### `cities` — słownik miast (20 wierszy)
 
@@ -111,9 +127,11 @@ nazywa się **normalizacją**. Nazwa i współrzędne Warszawy są w bazie w JED
 wierszu tabeli `cities`; pomiary trzymają tylko numer `city_id = 1`.
 Gdy potrzebujemy nazwy przy pomiarze — łączymy tabele JOIN-em (punkt 9).
 
-**Gdzie w kodzie:** definicja w `SCHEMA_SQL`; tłumaczenie "nazwa → id" robi
+**Gdzie w kodzie:** klucz obcy deklaruje `ForeignKey("cities.id")` w modelu
+`Measurement` (`collector/models.py`); tłumaczenie "nazwa → id" robi
 `get_city_id()` w `collector/db.py`; pilnowanie poprawności odnośników włącza
-`PRAGMA foreign_keys=ON` w `get_connection()`.
+`PRAGMA foreign_keys=ON` ustawiane przy każdym połączeniu silnika w
+`get_engine()`.
 
 ---
 
@@ -130,17 +148,25 @@ Mamy dwa takie więzy:
 - `UNIQUE(city_id, timestamp)` w `measurements` — jedno miasto nie może mieć
   dwóch pomiarów o tej samej godzinie. **To nasz mechanizm anty-duplikatowy.**
 
-Jak to działa w praktyce? `insert_measurement()` w `collector/db.py` używa:
+Jak to działa w praktyce? `insert_measurement()` w `collector/db.py` realizuje
+tę samą logikę co dawne `INSERT OR IGNORE`, ale środkami ORM:
 
-```sql
-INSERT OR IGNORE INTO measurements (city_id, timestamp, ...) VALUES (?, ?, ...)
+```python
+try:
+    with session.begin_nested():   # SAVEPOINT — mała "pod-transakcja"
+        session.add(Measurement(city_id=city_id, **values))
+    return True                    # zapis się udał — wiersz wszedł
+except IntegrityError:
+    return False                   # UNIQUE odrzucił duplikat — pomijamy
 ```
 
-`OR IGNORE` mówi: jeśli wstawienie złamałoby więz UNIQUE (duplikat) — **nie
-rzucaj błędu, po prostu nic nie rób**. Funkcja zwraca `True`/`False` zależnie
-od tego, czy wiersz faktycznie wszedł (sprawdzamy `cur.rowcount > 0`).
-Dzięki temu backfill można odpalić pięć razy z rzędu i baza się nie zaśmieci —
-drugi i kolejne przebiegi zobaczą same duplikaty.
+Idea: próbujemy dodać obiekt w obrębie **zagnieżdżonej transakcji** (SAVEPOINT).
+Jeśli wstawienie złamie więz UNIQUE, baza zgłasza `IntegrityError`; my go
+łapiemy i zwracamy `False`, a SAVEPOINT jest wycofywany — **wycofuje się tylko
+ten jeden wiersz**, wcześniej dodane w sesji pomiary zostają nienaruszone.
+Gdy wiersz wejdzie poprawnie — zwracamy `True`. Efekt jest identyczny jak
+`INSERT OR IGNORE`: backfill można odpalić pięć razy z rzędu i baza się nie
+zaśmieci — drugi i kolejne przebiegi zobaczą same duplikaty.
 
 ---
 
@@ -152,7 +178,8 @@ w bazie to dokładnie to**: posortowana struktura pomocnicza, dzięki której ba
 nie musi przeglądać całej tabeli (tzw. *full table scan*), tylko skacze prosto
 do właściwych wierszy.
 
-Nasze indeksy (w `SCHEMA_SQL`):
+Nasze indeksy (zadeklarowane w modelu `Measurement` przez `Index(...)`,
+co ORM tłumaczy na):
 
 ```sql
 CREATE INDEX idx_measurements_city_time ON measurements(city_id, timestamp);
@@ -186,18 +213,19 @@ zobaczyć w katalogu `data/`), a czytelnicy w tym czasie spokojnie czytają
 ostatni spójny stan głównego pliku. Co jakiś czas dziennik jest scalany do
 głównego pliku. Efekt: **czytanie i pisanie nie blokują się nawzajem**.
 
-**Gdzie w kodzie:** `get_connection()` w `collector/db.py` wykonuje
-`PRAGMA journal_mode=WAL;` przy każdym otwarciu połączenia (oraz `init_db.py`
-przy tworzeniu bazy).
+**Gdzie w kodzie:** `get_engine()` w `collector/db.py` rejestruje nasłuch
+zdarzenia `connect` silnika SQLAlchemy, który wykonuje `PRAGMA journal_mode=WAL;`
+przy każdym nowym połączeniu (z tego silnika korzysta i backfill, i `init_db.py`).
 
 ---
 
 ## 8. Połączenie tylko-do-odczytu w dashboardzie
 
-`_connect()` w `dashboard/data_loader.py`:
+`_read_engine()` w `dashboard/data_loader.py` tworzy silnik SQLAlchemy
+otwierający bazę przez URI w trybie tylko-do-odczytu:
 
 ```python
-conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=30)
+create_engine(f"sqlite:///file:{abs_path}?mode=ro&uri=true")
 ```
 
 `mode=ro` = *read-only*. Dashboard fizycznie **nie może** nic zapisać ani
@@ -213,6 +241,12 @@ zmienić — każda próba skończy się błędem. Po co?
 ---
 
 ## 9. Rozbiór zapytań SQL z `data_loader.py`
+
+Wszystkie poniższe zapytania budujemy w `data_loader.py` **przez ORM** —
+funkcją `select(...)` na modelach (`select(City.id, ..., Measurement.temp_c)
+.join(City).where(*warunki).order_by(...)`). Pokazany niżej SQL to **to, co
+SQLAlchemy z tych wyrażeń generuje** i faktycznie wysyła do bazy — rozumienie
+tego SQL-a jest sednem projektu, więc rozbieramy go po kawałku.
 
 ### 9a. SELECT z JOIN — łączenie pomiarów z miastami
 
@@ -296,7 +330,7 @@ filtrują **identycznie** i nie ma dwóch kopii tej logiki do utrzymywania.
 
 ### 9d. Agregacja w czasie — strftime + GROUP BY + AVG
 
-Gdy użytkownik wybierze agregację godzinową/dzienną/tygodniową,
+Gdy użytkownik wybierze agregację dzienną/tygodniową,
 `load_measurements` zamiast surowych punktów liczy średnie w "kubełkach" czasu:
 
 ```sql
@@ -313,22 +347,26 @@ Jak to działa:
   Nasze timestampy to teksty ISO, np. `2026-06-08T14:30:00Z`. Format
   `'%Y-%m-%dT00:00:00Z'` zamienia każdą godzinę tego dnia na tę samą etykietę
   `2026-06-08T00:00:00Z` — wszystkie pomiary z 8 czerwca "wpadają do jednego
-  kubełka". Analogicznie `'%Y-%m-%dT%H:00:00Z'` kubełkuje po godzinach
-  (obcina minuty), a `'%Y-W%W'` po tygodniach (rok + numer tygodnia, np.
-  `2026-W23`).
+  kubełka". Analogicznie `'%Y-W%W'` kubełkuje po tygodniach (rok + numer
+  tygodnia, np. `2026-W23`). Po godzinach (`'%Y-%m-%dT%H:00:00Z'`) **nie**
+  agregujemy — dane ze źródła są już godzinowe, więc wynik byłby identyczny
+  z `raw`.
 - `GROUP BY` zbiera wiersze o tej samej parze (miasto, etykieta) w grupy.
 - `AVG(...)` liczy średnią w każdej grupie. Czyli "dzienna temperatura
   Warszawy" = średnia ze wszystkich pomiarów Warszawy danego dnia.
 
-### 9e. Parametryzacja `?` — ochrona przed SQL injection
+### 9e. Parametryzacja — ochrona przed SQL injection
 
-W całym projekcie wartości NIGDY nie są wklejane do SQL-a jako tekst.
-Zamiast tego piszemy znak zapytania, a wartości podajemy osobno:
+W całym projekcie wartości NIGDY nie są wklejane do SQL-a jako tekst — i tu ORM
+pomaga "z urzędu". Pisząc warunek przez `select()`:
 
 ```python
-conn.execute("SELECT id FROM cities WHERE name = ? AND country = ?",
-             ("Warsaw", "PL"))
+select(City.id).where(City.name == "Warsaw", City.country == "PL")
 ```
+
+SQLAlchemy **samo** zamienia stałe na parametry i generuje
+`... WHERE name = ? AND country = ?`, podając wartości osobnym kanałem — nigdy
+nie skleja ich z tekstem zapytania.
 
 Dlaczego to ważne? Wyobraź sobie naiwną wersję:
 
@@ -344,8 +382,10 @@ kanałami**: wartość jest zawsze traktowana jako dana (zwykły napis), nigdy
 jako fragment polecenia. Apostrofy i średniki w danych nic nie znaczą.
 Bonus: parametryzacja załatwia też poprawne typy i kodowanie znaków.
 
-W `_build_where()` widać to w praktyce — nawet listy budujemy bezpiecznie:
-`IN (?,?,?)` z odpowiednią liczbą znaków zapytania, a wartości w `params`.
+W `_build_where()` widać to w praktyce — nawet listy (`Measurement.city_id
+.in_(city_ids)`) ORM rozpisuje na bezpieczne `IN (?,?,?)` z wartościami podanymi
+osobno. Pisząc przez ORM, praktycznie nie da się przypadkiem wkleić wartości do
+tekstu SQL-a.
 
 ---
 
@@ -355,13 +395,16 @@ W `_build_where()` widać to w praktyce — nawet listy budujemy bezpiecznie:
 - **Wiersz / rekord** — jeden obiekt, np. jeden pomiar pogody.
 - **SQL** — język zapytań do bazy (SELECT/INSERT/CREATE...).
 - **SQLite** — baza w jednym pliku, bez serwera, wbudowana w Pythona.
+- **ORM (SQLAlchemy)** — mapowanie obiektowo-relacyjne: tabela ↔ klasa Pythona, wiersz ↔ obiekt; zapytania piszemy przez `select()`, a biblioteka generuje SQL.
+- **Model** — klasa opisująca tabelę (u nas `City`, `Measurement`, `CollectionLog` w `collector/models.py`).
 - **Klucz główny (PRIMARY KEY)** — kolumna jednoznacznie identyfikująca wiersz.
 - **AUTOINCREMENT** — baza sama nadaje kolejne numery id.
 - **Klucz obcy (FOREIGN KEY)** — kolumna wskazująca na klucz główny innej tabeli (`city_id` → `cities.id`).
 - **Normalizacja** — projektowanie tabel tak, by każda informacja była zapisana tylko raz.
 - **Więz (constraint)** — reguła, której baza pilnuje sama (NOT NULL, UNIQUE...).
 - **UNIQUE** — zakaz powtórzeń wartości (u nas: pary city_id+timestamp).
-- **INSERT OR IGNORE** — wstaw, a jeśli duplikat — po cichu pomiń.
+- **INSERT OR IGNORE** — wstaw, a jeśli duplikat — po cichu pomiń (u nas realizowane przez ORM: SAVEPOINT + przechwycenie `IntegrityError`).
+- **SAVEPOINT (transakcja zagnieżdżona)** — punkt wewnątrz transakcji, do którego można wycofać tylko część zmian; ORM otwiera go przez `session.begin_nested()`.
 - **Indeks** — "skorowidz" przyspieszający wyszukiwanie kosztem odrobiny miejsca.
 - **JOIN** — sklejenie wierszy z dwóch tabel po pasującym kluczu.
 - **LEFT JOIN** — jak JOIN, ale zachowuje wiersze z lewej tabeli bez pary (z NULL-ami).

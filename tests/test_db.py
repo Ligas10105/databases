@@ -1,34 +1,29 @@
-"""Tests for collector.db using in-memory SQLite."""
+"""Testy collector.db przez ORM (SQLAlchemy) na bazie w pamięci."""
 from __future__ import annotations
 
-import sqlite3
 import sys
 from pathlib import Path
 
 import pytest
+from sqlalchemy import create_engine, func, select
+from sqlalchemy.orm import Session
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from collector import db
-from scripts.init_db import SCHEMA_SQL
+from collector.models import Base, City, CollectionLog, Measurement
 
 
 @pytest.fixture
-def conn():
-    c = sqlite3.connect(":memory:")
-    c.row_factory = sqlite3.Row
-    c.executescript(SCHEMA_SQL)
-    c.execute(
-        "INSERT INTO cities (name, country, lat, lon) VALUES (?, ?, ?, ?)",
-        ("Warsaw", "PL", 52.23, 21.01),
-    )
-    c.execute(
-        "INSERT INTO cities (name, country, lat, lon) VALUES (?, ?, ?, ?)",
-        ("Berlin", "DE", 52.52, 13.40),
-    )
-    c.commit()
-    yield c
-    c.close()
+def session():
+    # Baza w pamięci, schemat tworzony z modeli ORM (zamiast surowego SQL).
+    engine = create_engine("sqlite://", future=True)
+    Base.metadata.create_all(engine)
+    with Session(engine, future=True) as s:
+        s.add(City(name="Warsaw", country="PL", lat=52.23, lon=21.01))
+        s.add(City(name="Berlin", country="DE", lat=52.52, lon=13.40))
+        s.commit()
+        yield s
 
 
 @pytest.fixture
@@ -50,67 +45,74 @@ def sample_measurement():
     }
 
 
-def test_get_city_id_existing(conn):
-    assert db.get_city_id(conn, "Warsaw", "PL") == 1
-    assert db.get_city_id(conn, "Berlin", "DE") == 2
+def test_get_city_id_existing(session):
+    assert db.get_city_id(session, "Warsaw", "PL") == 1
+    assert db.get_city_id(session, "Berlin", "DE") == 2
 
 
-def test_get_city_id_missing(conn):
-    assert db.get_city_id(conn, "Nowhere", "XX") is None
+def test_get_city_id_missing(session):
+    assert db.get_city_id(session, "Nowhere", "XX") is None
 
 
-def test_insert_measurement_inserts_row(conn, sample_measurement):
-    inserted = db.insert_measurement(conn, 1, sample_measurement)
+def test_insert_measurement_inserts_row(session, sample_measurement):
+    inserted = db.insert_measurement(session, 1, sample_measurement)
     assert inserted is True
 
-    row = conn.execute("SELECT * FROM measurements WHERE city_id = 1").fetchone()
+    row = session.execute(
+        select(Measurement).where(Measurement.city_id == 1)
+    ).scalar_one()
     assert row is not None
-    assert row["temp_c"] == 5.2
-    assert row["weather_main"] == "Clouds"
-    assert row["source"] == "owm"
+    assert row.temp_c == 5.2
+    assert row.weather_main == "Clouds"
+    assert row.source == "owm"
 
 
-def test_insert_measurement_skips_duplicate(conn, sample_measurement):
-    first = db.insert_measurement(conn, 1, sample_measurement)
-    second = db.insert_measurement(conn, 1, sample_measurement)
+def test_insert_measurement_skips_duplicate(session, sample_measurement):
+    first = db.insert_measurement(session, 1, sample_measurement)
+    second = db.insert_measurement(session, 1, sample_measurement)
     assert first is True
     assert second is False
 
-    count = conn.execute("SELECT COUNT(*) FROM measurements WHERE city_id = 1").fetchone()[0]
+    count = session.execute(
+        select(func.count()).select_from(Measurement).where(Measurement.city_id == 1)
+    ).scalar_one()
     assert count == 1
 
 
-def test_insert_measurement_different_timestamps(conn, sample_measurement):
-    db.insert_measurement(conn, 1, sample_measurement)
+def test_insert_measurement_different_timestamps(session, sample_measurement):
+    db.insert_measurement(session, 1, sample_measurement)
     second = dict(sample_measurement, timestamp="2024-01-15T12:30:00Z", temp_c=6.0)
-    db.insert_measurement(conn, 1, second)
+    db.insert_measurement(session, 1, second)
 
-    rows = conn.execute(
-        "SELECT timestamp FROM measurements WHERE city_id = 1 ORDER BY timestamp"
-    ).fetchall()
+    rows = session.execute(
+        select(Measurement.timestamp)
+        .where(Measurement.city_id == 1)
+        .order_by(Measurement.timestamp)
+    ).all()
     assert len(rows) == 2
 
 
 def test_load_latest_per_city_filtered(tmp_path, sample_measurement):
-    # data_loader otwiera bazę w trybie read-only (URI file:...?mode=ro),
-    # więc zamiast :memory: tworzymy plikową bazę tymczasową.
+    # data_loader otwiera bazę read-only (URI file:...?mode=ro), więc zamiast
+    # bazy w pamięci tworzymy plikową bazę tymczasową (bez WAL, by ro ją widział).
     from dashboard.data_loader import load_latest_per_city_filtered
 
     db_path = tmp_path / "test.db"
-    c = sqlite3.connect(db_path)
-    c.executescript(SCHEMA_SQL)
-    c.execute("INSERT INTO cities (name, country, lat, lon) VALUES ('Warsaw','PL',52.23,21.01)")
-    c.execute("INSERT INTO cities (name, country, lat, lon) VALUES ('Berlin','DE',52.52,13.40)")
-    # 2 pomiary per miasto — drugi nowszy
-    for city_id, ts, temp in [
-        (1, "2024-01-15T10:00:00Z", 1.0),
-        (1, "2024-01-15T12:00:00Z", 5.2),
-        (2, "2024-01-15T10:00:00Z", 2.0),
-        (2, "2024-01-15T12:00:00Z", 7.0),
-    ]:
-        db.insert_measurement(c, city_id, dict(sample_measurement, timestamp=ts, temp_c=temp))
-    c.commit()
-    c.close()
+    engine = create_engine(f"sqlite:///{db_path}", future=True)
+    Base.metadata.create_all(engine)
+    with Session(engine, future=True) as s:
+        s.add(City(name="Warsaw", country="PL", lat=52.23, lon=21.01))
+        s.add(City(name="Berlin", country="DE", lat=52.52, lon=13.40))
+        s.commit()
+        # 2 pomiary per miasto — drugi nowszy
+        for city_id, ts, temp in [
+            (1, "2024-01-15T10:00:00Z", 1.0),
+            (1, "2024-01-15T12:00:00Z", 5.2),
+            (2, "2024-01-15T10:00:00Z", 2.0),
+            (2, "2024-01-15T12:00:00Z", 7.0),
+        ]:
+            db.insert_measurement(s, city_id, dict(sample_measurement, timestamp=ts, temp_c=temp))
+        s.commit()
 
     # filtr: tylko Warszawa, pełny zakres dat → 1 wiersz, najnowszy pomiar
     df = load_latest_per_city_filtered(db_path, {
@@ -138,11 +140,11 @@ def test_load_latest_per_city_filtered(tmp_path, sample_measurement):
     assert df.empty
 
 
-def test_log_collection_run(conn):
-    db.log_collection_run(conn, cities_ok=18, cities_failed=2, source_used="owm:18", notes="failed: X,Y")
-    row = conn.execute("SELECT * FROM collection_log").fetchone()
-    assert row["cities_ok"] == 18
-    assert row["cities_failed"] == 2
-    assert row["source_used"] == "owm:18"
-    assert "failed" in row["notes"]
-    assert row["run_at"].endswith("Z")
+def test_log_collection_run(session):
+    db.log_collection_run(session, cities_ok=18, cities_failed=2, source_used="owm:18", notes="failed: X,Y")
+    row = session.execute(select(CollectionLog)).scalar_one()
+    assert row.cities_ok == 18
+    assert row.cities_failed == 2
+    assert row.source_used == "owm:18"
+    assert "failed" in row.notes
+    assert row.run_at.endswith("Z")

@@ -26,7 +26,9 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from collector.db import get_city_id, get_connection, insert_measurement, log_collection_run
+from sqlalchemy.orm import Session
+
+from collector.db import get_city_id, get_engine, insert_measurement, log_collection_run
 
 logging.basicConfig(
     level=logging.INFO,
@@ -201,16 +203,16 @@ def main() -> None:
     # Odcinamy godziny z przyszłości względem chwili startu skryptu.
     cutoff = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    conn = get_connection(db_path)
+    engine = get_engine(db_path)
     total_inserted = 0
     total_dup = 0
     cities_ok = 0
     cities_failed = 0
     failed_names: list[str] = []
 
-    try:
+    with Session(engine, future=True) as session:
         for city in cities:
-            city_id = get_city_id(conn, city["name"], city["country"])
+            city_id = get_city_id(session, city["name"], city["country"])
             if city_id is None:
                 logger.warning("missing city in DB: %s,%s", city["name"], city["country"])
                 cities_failed += 1
@@ -226,7 +228,7 @@ def main() -> None:
             ins = 0
             dup = 0
             for row in rows:
-                if insert_measurement(conn, city_id, row):
+                if insert_measurement(session, city_id, row):
                     ins += 1
                 else:
                     dup += 1
@@ -238,17 +240,16 @@ def main() -> None:
             time.sleep(args.sleep)
 
         log_collection_run(
-            conn,
+            session,
             cities_ok=cities_ok,
             cities_failed=cities_failed,
             source_used=f"open_meteo (past_days={args.days})",
             notes=f"backfill: inserted={total_inserted} dup={total_dup}"
                   + (f" failed={','.join(failed_names)}" if failed_names else ""),
         )
+        session.commit()
         logger.info("DONE: cities ok=%d failed=%d | rows inserted=%d dup=%d",
                     cities_ok, cities_failed, total_inserted, total_dup)
-    finally:
-        conn.close()
 
 
 if __name__ == "__main__":

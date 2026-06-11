@@ -19,6 +19,17 @@ wbudowana w Pythona, zero administracji. Mój projekt to jedna maszyna, jeden
 pisarz i kilkadziesiąt tysięcy wierszy — serwer bazodanowy byłby przerostem
 formy.
 
+**Używacie ORM-a? Jakiego i po co?**
+Tak — SQLAlchemy. ORM (Object–Relational Mapping) to warstwa, która mapuje
+tabele na klasy Pythona: `City`, `Measurement`, `CollectionLog` w
+`collector/models.py` to jednocześnie definicja schematu (z nich tworzę bazę
+przez `Base.metadata.create_all`) i obiekty, na których operuję. Zapis robię na
+sesji ORM (`session.add(...)`), a zapytania dashboardu buduję funkcją
+`select(...)` zamiast sklejać napisy SQL. Zyski: jedno źródło prawdy o
+schemacie, automatyczna parametryzacja (ochrona przed SQL injection) i kod,
+który czyta się obiektowo. SQL nadal rozumiem — ORM generuje go pod spodem
+i potrafię pokazać, co dokładnie leci do bazy.
+
 **Skąd dane — czy to pomiary, czy model?**
 Z Open-Meteo, darmowego API bez klucza, które udostępnia dane narodowych służb
 meteorologicznych. Parametr `past_days` zwraca ostatnie dni godzina po godzinie
@@ -43,10 +54,11 @@ INSERT, ale odczyty dashboardu są dzięki temu natychmiastowe.
 
 **Jak obsługujecie duplikaty?**
 Dwuwarstwowo: w schemacie jest więz `UNIQUE(city_id, timestamp)` — baza sama
-nie pozwoli zapisać dwóch pomiarów tego samego miasta o tej samej godzinie —
-a wstawiam przez `INSERT OR IGNORE`, więc duplikat jest po cichu pomijany
-zamiast rzucać błąd. Dzięki temu backfill można odpalać codziennie i baza się
-nie zaśmieci — dokleja tylko nowe godziny.
+nie pozwoli zapisać dwóch pomiarów tego samego miasta o tej samej godzinie.
+Wstawiam przez ORM w zagnieżdżonej transakcji (SAVEPOINT): jeśli więz odrzuci
+duplikat, łapię `IntegrityError`, wycofuję tylko ten jeden wiersz i jadę dalej —
+to odpowiednik `INSERT OR IGNORE`. Dzięki temu backfill można odpalać codziennie
+i baza się nie zaśmieci — dokleja tylko nowe godziny.
 
 **Co to klucz obcy i normalizacja — czemu dwie tabele?**
 Klucz obcy to kolumna wskazująca na klucz główny innej tabeli — u mnie
@@ -82,12 +94,14 @@ Bo miasta są w różnych strefach czasowych i do tego dochodzi czas letni/zimow
 jednoznacznym czasie UTC jako tekst ISO 8601, który dobrze się sortuje
 alfabetycznie. Na czas lokalny przeliczać można dopiero przy wyświetlaniu.
 
-**Jak liczona jest agregacja godzinowa/dzienna/tygodniowa?**
-W SQL-u: funkcja `strftime` przycina timestamp do wspólnej etykiety — np. dla
-agregacji dziennej każdy pomiar z 8 czerwca dostaje etykietę
-`2026-06-08T00:00:00Z` — potem `GROUP BY` zbiera wiersze o tej samej parze
-(miasto, etykieta), a `AVG` liczy średnią w każdej grupie. Czyli "dzienna
+**Jak liczona jest agregacja dzienna/tygodniowa?**
+W SQL-u (generowanym przez ORM): funkcja `strftime` przycina timestamp do
+wspólnej etykiety — np. dla agregacji dziennej każdy pomiar z 8 czerwca dostaje
+etykietę `2026-06-08T00:00:00Z` — potem `GROUP BY` zbiera wiersze o tej samej
+parze (miasto, etykieta), a `AVG` liczy średnią w każdej grupie. Czyli "dzienna
 temperatura Warszawy" to średnia ze wszystkich pomiarów Warszawy danego dnia.
+Agregacji godzinowej świadomie nie dajemy — źródło jest już godzinowe, więc
+byłaby identyczna z `raw`.
 
 **Jakie macie filtry i czemu są wspólne dla wszystkich widoków?**
 Sześć: zakres dat, wybór miast, parametr, zakres wartości, poziom agregacji
@@ -106,16 +120,18 @@ Marker, popup i heatmapa korzystają z tego samego przefiltrowanego zbioru,
 więc mapa zawsze zgadza się z wykresami.
 
 **Co chroni was przed SQL injection?**
-Parametryzacja: w zapytaniach nigdy nie wklejam wartości do tekstu SQL-a, tylko
-piszę `?`, a wartości podaję osobną listą. Baza dostaje polecenie i dane dwoma
-różnymi kanałami, więc dane — choćby zawierały apostrofy czy `DROP TABLE` —
-zawsze są traktowane jak zwykły napis, nigdy jak kod.
+Parametryzacja — i robi ją za mnie ORM. Buduję zapytania przez `select(...)`
+z warunkami w stylu `City.name == wartosc`, a SQLAlchemy samo zamienia wartości
+na parametry (`?`) i podaje je osobnym kanałem niż treść zapytania. Dane —
+choćby zawierały apostrofy czy `DROP TABLE` — zawsze są traktowane jak zwykły
+napis, nigdy jak kod.
 
 **Co się stanie, jak API padnie podczas logowania?**
 Nic dramatycznego: miasto, dla którego zapytanie się nie powiodło, jest
 pomijane w tym przebiegu, a podsumowanie (ile miast OK, ile padło) trafia do
 tabeli `collection_log`. Przy następnym uruchomieniu backfill uzupełni braki —
-duplikaty godzin, które już są, odsieje `INSERT OR IGNORE`.
+duplikaty godzin, które już są, odsieje opisany wyżej mechanizm "wstaw albo
+pomiń" (SAVEPOINT + `IntegrityError` w ORM).
 
 **Skąd na mapie "najnowsze" dane, skoro to dane historyczne?**
 `past_days` w Open-Meteo zwraca dane aż do bieżącej godziny, więc wystarczy

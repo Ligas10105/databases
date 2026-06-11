@@ -1,62 +1,25 @@
-"""Initialize SQLite database: create schema and insert cities from config.yaml."""
+"""Inicjalizacja bazy: utworzenie schematu (z modeli ORM) i wstawienie miast.
+
+Schemat NIE jest już budowany ręcznym CREATE TABLE — powstaje z deklaratywnych
+modeli w `collector.models` przez `Base.metadata.create_all`. Miasta z config.yaml
+wstawiamy przez ORM, pomijając już istniejące (idempotentnie).
+"""
 from __future__ import annotations
 
-import os
-import sqlite3
 import sys
 from pathlib import Path
 
 import yaml
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from collector.db import get_engine
+from collector.models import Base, City
+
 CONFIG_PATH = PROJECT_ROOT / "config.yaml"
-
-SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS cities (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    country TEXT NOT NULL,
-    lat REAL NOT NULL,
-    lon REAL NOT NULL,
-    UNIQUE(name, country)
-);
-
-CREATE TABLE IF NOT EXISTS measurements (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    city_id INTEGER NOT NULL REFERENCES cities(id),
-    timestamp TEXT NOT NULL,
-    temp_c REAL,
-    feels_like_c REAL,
-    temp_min_c REAL,
-    temp_max_c REAL,
-    humidity_pct INTEGER,
-    pressure_hpa INTEGER,
-    wind_speed_ms REAL,
-    wind_deg INTEGER,
-    clouds_pct INTEGER,
-    weather_main TEXT,
-    weather_desc TEXT,
-    source TEXT DEFAULT 'open_meteo',
-    UNIQUE(city_id, timestamp)
-);
-
-CREATE INDEX IF NOT EXISTS idx_measurements_city_time
-    ON measurements(city_id, timestamp);
-
-CREATE INDEX IF NOT EXISTS idx_measurements_time
-    ON measurements(timestamp);
-
-CREATE TABLE IF NOT EXISTS collection_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_at TEXT NOT NULL,
-    cities_ok INTEGER,
-    cities_failed INTEGER,
-    source_used TEXT,
-    notes TEXT
-);
-"""
 
 
 def load_config(path: Path = CONFIG_PATH) -> dict:
@@ -66,20 +29,30 @@ def load_config(path: Path = CONFIG_PATH) -> dict:
 
 def init_db(db_path: Path, cities: list[dict]) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.executescript(SCHEMA_SQL)
+    engine = get_engine(db_path)
+    # Tworzymy tabele i indeksy na podstawie modeli ORM (CREATE TABLE IF NOT EXISTS).
+    Base.metadata.create_all(engine)
+
+    with Session(engine, future=True) as session:
         for city in cities:
-            conn.execute(
-                "INSERT OR IGNORE INTO cities (name, country, lat, lon) VALUES (?, ?, ?, ?)",
-                (city["name"], city["country"], city["lat"], city["lon"]),
-            )
-        conn.commit()
-        count = conn.execute("SELECT COUNT(*) FROM cities").fetchone()[0]
-        print(f"DB initialized at {db_path}. Cities in DB: {count}")
-    finally:
-        conn.close()
+            exists = session.execute(
+                select(City.id).where(
+                    City.name == city["name"], City.country == city["country"]
+                )
+            ).scalar_one_or_none()
+            if exists is None:
+                session.add(
+                    City(
+                        name=city["name"],
+                        country=city["country"],
+                        lat=city["lat"],
+                        lon=city["lon"],
+                    )
+                )
+        session.commit()
+        count = session.execute(select(func.count()).select_from(City)).scalar_one()
+
+    print(f"DB initialized at {db_path}. Cities in DB: {count}")
 
 
 def main() -> None:

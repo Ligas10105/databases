@@ -1,8 +1,9 @@
 # Weather System — logowanie i wizualizacja danych pogodowych
 
 Skrypt loguje godzinowe dane pogodowe dla 20 europejskich miast z API
-Open-Meteo do bazy SQLite, a dashboard Streamlit prezentuje je w trzech
-widokach: szeregi czasowe, analiza ilościowa i mapa — każdy z 6 filtrami.
+Open-Meteo do bazy SQLite (dostęp przez ORM — SQLAlchemy), a dashboard
+Streamlit prezentuje je w trzech widokach: szeregi czasowe, analiza ilościowa
+i mapa — każdy z 6 filtrami.
 
 ## Wymagania
 
@@ -45,3 +46,6 @@ pytest tests/ -v
 - `docs/01_przewodnik_po_projekcie.md` — jak system działa (architektura, przepływ danych)
 - `docs/02_baza_danych_od_zera.md` — pojęcia bazodanowe wyjaśnione na kodzie projektu
 - `docs/03_sciaga_na_obrone.md` — pytania i odpowiedzi na obronę
+- `docs/04_kluczowe_miejsca_w_kodzie.md` — mapa „gdzie w kodzie": filtry, agregacja, zapis, odczyt
+- `docs/05_sqlalchemy_orm.md` — SQLAlchemy (ORM): co to jest, co robi i gdzie go używamy
+- `docs/06_cheatsheet_1_strona.md` — ściąga 1-stronicowa do wydruku na obronę

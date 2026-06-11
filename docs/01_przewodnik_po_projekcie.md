@@ -43,13 +43,15 @@ Wyjaśnienie każdego kroku:
    pasujące do naszej tabeli: km/h → m/s, kod pogody WMO → kategoria tekstowa
    ("Rain", "Clouds"...), czas → ISO UTC. Godziny z przyszłości (API dorzuca
    prognozę na resztę doby) są odcinane — logujemy tylko przeszłość.
-3. **Logger → baza.** `collector/db.py` wstawia wiersze przez
-   `INSERT OR IGNORE` — duplikaty (godziny, które już są w bazie) są pomijane,
+3. **Logger → baza.** `collector/db.py` wstawia wiersze przez ORM (SQLAlchemy)
+   z logiką "wstaw albo pomiń duplikat" (SAVEPOINT + `IntegrityError`, czyli
+   odpowiednik `INSERT OR IGNORE`) — godziny, które już są w bazie, są pomijane,
    więc skrypt można odpalać codziennie i baza tylko przyrasta.
    Podsumowanie każdego przebiegu ląduje w tabeli `collection_log`.
-4. **Baza → dashboard.** Wszystkie zapytania SQL dashboardu mieszkają w jednym
-   pliku: `dashboard/data_loader.py`. Widoki (`views/`) nie piszą SQL-a same —
-   dostają gotowe tabele pandas. Dashboard łączy się z bazą **tylko do odczytu**.
+4. **Baza → dashboard.** Wszystkie zapytania dashboardu (budowane przez ORM
+   `select()`) mieszkają w jednym pliku: `dashboard/data_loader.py`. Widoki
+   (`views/`) nie piszą zapytań same — dostają gotowe tabele pandas. Dashboard
+   łączy się z bazą **tylko do odczytu**.
 5. **Dashboard → użytkownik.** `dashboard/app.py` rysuje pasek filtrów
    i trzy zakładki; każda zakładka dostaje ten sam słownik filtrów.
 
@@ -58,11 +60,12 @@ Wyjaśnienie każdego kroku:
 | Plik | Za co odpowiada |
 |---|---|
 | `config.yaml` | Konfiguracja: lista 20 miast (nazwa, kraj, współrzędne) i ścieżka do bazy (`database.path`) |
-| `scripts/init_db.py` | Jednorazowe utworzenie bazy: 3 tabele + 2 indeksy + wstawienie 20 miast |
-| `scripts/backfill.py` | Logowanie danych: pobiera historię godzinową z Open-Meteo i wstawia do bazy |
-| `collector/db.py` | Warstwa zapisu: połączenie (tryb WAL), `insert_measurement` (z odsiewaniem duplikatów), `log_collection_run` |
+| `collector/models.py` | Modele ORM (SQLAlchemy): klasy `City`, `Measurement`, `CollectionLog` = definicja schematu (tabele, klucze, UNIQUE, indeksy) |
+| `scripts/init_db.py` | Jednorazowe utworzenie bazy: tabele z modeli (`create_all`) + 2 indeksy + wstawienie 20 miast |
+| `scripts/backfill.py` | Logowanie danych: pobiera historię godzinową z Open-Meteo i wstawia do bazy (przez sesję ORM) |
+| `collector/db.py` | Warstwa zapisu (ORM): silnik (tryb WAL), sesje, `insert_measurement` (z odsiewaniem duplikatów), `log_collection_run` |
 | `dashboard/app.py` | Punkt startowy dashboardu: pasek filtrów (sidebar) + 3 zakładki |
-| `dashboard/data_loader.py` | WSZYSTKIE zapytania SQL dashboardu; wspólny budowniczy filtrów `_build_where()` |
+| `dashboard/data_loader.py` | WSZYSTKIE zapytania dashboardu (ORM `select()`, połączenie read-only); wspólny budowniczy filtrów `_build_where()` |
 | `dashboard/views/time_series.py` | Zakładka 1: wykres liniowy parametru w czasie (Plotly) |
 | `dashboard/views/quantitative.py` | Zakładka 2: statystyki (min/max/średnia/odchylenie), histogram, box plot |
 | `dashboard/views/spatial.py` | Zakładka 3: mapa Folium — marker per miasto z najnowszym pomiarem + heatmapa |
@@ -87,7 +90,7 @@ Wyjaśnienie każdego kroku:
   2. multiselect miast,
   3. wybór parametru (temperatura, odczuwalna, wilgotność, ciśnienie, wiatr, zachmurzenie),
   4. suwak zakresu wartości,
-  5. poziom agregacji (raw / godzinowa / dzienna / tygodniowa),
+  5. poziom agregacji (raw / dzienna / tygodniowa),
   6. warunki pogodowe (Clear, Rain, Clouds...).
 
   Wynik to jeden słownik `filters`, przekazywany do **wszystkich trzech

@@ -82,9 +82,11 @@ def _build_sidebar(db_path: str) -> dict:
     else:
         value_min, value_max = None, None
 
+    # 'hourly' celowo pominięte: źródło Open-Meteo jest już godzinowe,
+    # więc agregacja godzinowa dawałaby wynik identyczny z 'raw'.
     aggregation = st.sidebar.selectbox(
         "Aggregation",
-        options=["raw", "hourly", "daily", "weekly"],
+        options=["raw", "daily", "weekly"],
         index=0,
     )
 
